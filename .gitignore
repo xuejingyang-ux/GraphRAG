@@ -1,0 +1,12 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+graph_rag.db
+test_results.json
+*.docx
+项目研究报告.md

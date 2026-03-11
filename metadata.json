@@ -1,0 +1,5 @@
+{
+  "name": "GraphRAG: 增强型知识图谱问答系统",
+  "description": "基于大模型与知识图谱的增强型RAG系统，支持多跳推理与知识可视化溯源。",
+  "requestFramePermissions": []
+}
