@@ -36,23 +36,10 @@ interface Link extends d3.SimulationLinkDatum<Node> {
   label: string;
 }
 
-const SAMPLE_TEXTS = [
-  '周星驰，1962年6月22日出生于中国香港，祖籍浙江宁波，是演员、导演、编剧、制作人。',
-  '《大话西游》由刘镇伟执导，周星驰、朱茵、吴孟达等主演，是华语经典奇幻喜剧电影。',
-  '刘镇伟，英文名 Jeffrey Lau，是中国香港导演、编剧、制作人。',
-  '《功夫》由周星驰执导并主演，是一部融合动作与喜剧风格的电影。',
-  '星爷通常被认为是周星驰的常见别称。',
-  '《少林足球》由周星驰自编自导自演，将功夫元素与足球运动结合。',
-  '吴孟达是周星驰的重要合作伙伴，两人共同出演过多部经典电影。',
-  '朱茵在《大话西游》中饰演紫霞仙子，这一角色广受欢迎。',
-  '西安电影制片厂成立于1958年，是中国重要的电影制片机构之一。',
-  '丽的电视后来更名为亚洲电视，简称 ATV。',
-];
-
 const INITIAL_STEPS = [
   '正在识别问题中的核心实体',
   '正在检索两跳图谱关系',
-  '正在执行向量相似度召回',
+  '正在执行相似内容召回',
   '正在汇总证据并生成回答',
 ];
 
@@ -180,12 +167,10 @@ const GraphView = ({ data }: { data: { nodes: Node[]; links: Link[] } }) => {
 function buildGraph(graph: GraphRelation[]) {
   const nodes = Array.from(
     new Map(
-      graph
-        .flatMap((item) => [
-          [item.sId, { id: item.sId, name: item.s, type: 'entity' }],
-          [item.oId, { id: item.oId, name: item.o, type: 'entity' }],
-        ])
-        .map(([id, node]) => [id, node]),
+      graph.flatMap((item) => [
+        [item.sId, { id: item.sId, name: item.s, type: 'entity' }],
+        [item.oId, { id: item.oId, name: item.o, type: 'entity' }],
+      ]),
     ).values(),
   ) as Node[];
 
@@ -202,7 +187,7 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
       role: 'assistant',
-      content: '你好，我是 GraphRAG 问答助手。你可以先导入示例知识，再询问人物、作品和关系问题。',
+      content: '你好，我是 GraphRAG 问答助手。你可以先导入 data 文件夹中的电影数据集，再围绕电影、导演、演员与合作关系进行提问。',
     },
   ]);
   const [input, setInput] = useState('');
@@ -235,7 +220,6 @@ export default function App() {
         body: JSON.stringify({ query: userMsg }),
       });
       const data = await response.json();
-
       if (!response.ok) {
         throw new Error(data.error || '查询失败');
       }
@@ -261,36 +245,30 @@ export default function App() {
     }
   };
 
-  const handleIngestSample = async () => {
+  const handleIngestDataset = async () => {
     if (loading) {
       return;
     }
 
     setLoading(true);
-    setThinkingSteps(['正在导入示例数据', '正在抽取实体关系', '正在写入向量与图谱']);
+    setThinkingSteps(['正在扫描 data 数据集', '正在构建电影知识图谱', '正在生成检索索引']);
 
     try {
-      for (const text of SAMPLE_TEXTS) {
-        const response = await fetch('/api/ingest', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || '示例导入失败');
-        }
+      const response = await fetch('/api/ingest-dataset', { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || '数据集导入失败');
       }
 
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
-          content: '示例知识已导入完成。你现在可以提问，例如“周星驰和功夫有什么关系？”',
+          content: `data 数据集导入完成，共写入 ${data.movies} 部电影、${data.edges} 条合作关系、${data.entities} 个实体和 ${data.relationships} 条关系。你现在可以提问，例如“《英雄》是谁执导的？”、“张国荣和梁家辉有什么关系？”或“姜文主演过什么电影？”。`,
         },
       ]);
     } catch (error) {
-      const message = error instanceof Error ? error.message : '示例导入失败';
+      const message = error instanceof Error ? error.message : '数据集导入失败';
       setMessages((prev) => [...prev, { role: 'assistant', content: `导入失败：${message}` }]);
     } finally {
       setLoading(false);
@@ -303,7 +281,7 @@ export default function App() {
       return;
     }
 
-    const confirmed = window.confirm('确定要清空已经构建的知识图谱和向量数据吗？该操作不可恢复。');
+    const confirmed = window.confirm('确定要清空已经构建的知识图谱和检索数据吗？该操作不可恢复。');
     if (!confirmed) {
       return;
     }
@@ -319,7 +297,7 @@ export default function App() {
       setMessages([
         {
           role: 'assistant',
-          content: '知识库已经清空。你可以重新导入样本或开始新一轮构建。',
+          content: '知识库已经清空。你可以重新导入 data 数据集并开始新一轮问答。',
         },
       ]);
       setActiveGraph({ nodes: [], links: [] });
@@ -342,22 +320,22 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight text-slate-800">GraphRAG</h1>
-              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">增强型知识图谱问答</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">电影知识图谱问答</p>
             </div>
           </div>
         </div>
 
         <div className="flex-1 space-y-4 overflow-y-auto p-4">
           <button
-            onClick={handleIngestSample}
+            onClick={handleIngestDataset}
             className="group w-full rounded-xl border border-slate-200 bg-slate-50 p-4 text-left transition-all hover:border-emerald-200 hover:bg-slate-100"
           >
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-emerald-600">系统初始化</span>
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-600">数据集导入</span>
               <ChevronRight className="h-4 w-4 text-slate-400 transition-transform group-hover:translate-x-1" />
             </div>
-            <p className="text-sm font-semibold text-slate-700">导入示例知识库</p>
-            <p className="mt-1 text-xs text-slate-500">加载样本文本并自动构建向量与图谱。</p>
+            <p className="text-sm font-semibold text-slate-700">导入 data 目录数据集</p>
+            <p className="mt-1 text-xs text-slate-500">解析 Excel/Graph 数据并自动构建电影知识图谱。</p>
           </button>
 
           <button
@@ -369,23 +347,23 @@ export default function App() {
               <Trash2 className="h-4 w-4 text-red-400" />
             </div>
             <p className="text-sm font-semibold text-slate-700">清空知识库</p>
-            <p className="mt-1 text-xs text-slate-500">重置全部文档、实体关系与向量索引。</p>
+            <p className="mt-1 text-xs text-slate-500">重置全部文档、实体关系与检索索引。</p>
           </button>
 
           <div className="pt-4">
             <h3 className="mb-3 px-2 text-[10px] font-bold uppercase tracking-widest text-slate-400">系统状态</h3>
             <div className="space-y-2">
               <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
-                <span className="text-xs text-slate-600">向量索引（智谱）</span>
-                <span className="rounded bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">已接入</span>
+                <span className="text-xs text-slate-600">数据源</span>
+                <span className="rounded bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">data 文件夹</span>
+              </div>
+              <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+                <span className="text-xs text-slate-600">向量/文本召回</span>
+                <span className="rounded bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">可用</span>
               </div>
               <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
                 <span className="text-xs text-slate-600">图谱检索（2-Hop）</span>
                 <span className="rounded bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">可用</span>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
-                <span className="text-xs text-slate-600">实体对齐</span>
-                <span className="rounded bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-600">启用中</span>
               </div>
             </div>
           </div>
@@ -394,7 +372,7 @@ export default function App() {
         <div className="border-t border-slate-100 p-6">
           <div className="flex items-center gap-3 text-slate-400">
             <Info className="h-4 w-4" />
-            <span className="text-xs">版本 v1.1.0</span>
+            <span className="text-xs">版本 v1.2.0</span>
           </div>
         </div>
       </aside>
@@ -407,12 +385,12 @@ export default function App() {
               <div className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-indigo-600 text-[10px] font-bold text-white shadow-sm">KG</div>
             </div>
             <div>
-              <h2 className="text-sm font-bold text-slate-800">混合检索推理引擎</h2>
-              <p className="text-[10px] font-medium text-slate-500">结合向量召回、实体对齐与图谱路径推理</p>
+              <h2 className="text-sm font-bold text-slate-800">电影 GraphRAG 推理引擎</h2>
+              <p className="text-[10px] font-medium text-slate-500">结合 data 数据集、文本召回与图谱路径推理</p>
             </div>
           </div>
           <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-medium text-slate-500 shadow-sm">
-            智谱 GLM + SQLite
+            智谱 GLM + SQLite + data
           </div>
         </header>
 
@@ -501,7 +479,7 @@ export default function App() {
                   <input
                     value={input}
                     onChange={(event) => setInput(event.target.value)}
-                    placeholder="例如：周星驰和《功夫》是什么关系？"
+                    placeholder="例如：《英雄》是谁执导的？张国荣和梁家辉有什么关系？"
                     className="flex-1 border-none bg-transparent px-4 py-2 text-sm text-slate-700 placeholder:text-slate-400 focus:ring-0"
                   />
                   <button
@@ -514,7 +492,7 @@ export default function App() {
                 </div>
               </form>
               <p className="mt-4 text-center text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                由智谱 GLM 与 SQLite 图谱引擎驱动
+                由智谱 GLM、SQLite 与本地电影数据集驱动
               </p>
             </div>
           </section>
