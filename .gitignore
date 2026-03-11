@@ -1,4 +1,4 @@
-node_modules/
+﻿node_modules/
 build/
 dist/
 coverage/
@@ -8,5 +8,8 @@ coverage/
 !.env.example
 graph_rag.db
 test_results.json
+dataset_report_results.json
 *.docx
 项目研究报告.md
+__pycache__/
+scripts/__pycache__/
