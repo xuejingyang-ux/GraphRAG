@@ -1,0 +1,1 @@
+"""Medical GraphRAG project package."""

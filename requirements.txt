@@ -1,0 +1,13 @@
+streamlit>=1.43.0
+streamlit-agraph>=0.0.45
+langchain>=0.3.24
+langchain-openai>=0.3.14
+langchain-chroma>=0.2.2
+langchain-huggingface>=0.1.2
+langchain-text-splitters>=0.3.8
+langchain-core>=0.3.56
+chromadb>=0.6.3
+sentence-transformers>=3.4.1
+python-dotenv>=1.0.1
+orjson>=3.10.16
+tqdm>=4.67.1
