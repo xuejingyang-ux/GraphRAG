@@ -6,6 +6,24 @@ from openai import OpenAI
 
 
 _ENV_LOADED = False
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "GIT_HTTP_PROXY",
+    "GIT_HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+_DEAD_LOCAL_PROXY_VALUES = {
+    "http://127.0.0.1:9",
+    "https://127.0.0.1:9",
+    "127.0.0.1:9",
+    "http://localhost:9",
+    "https://localhost:9",
+    "localhost:9",
+}
 
 
 def _load_dotenv_if_exists() -> None:
@@ -41,6 +59,16 @@ def _read_env(name: str, default: Optional[str] = None) -> Optional[str]:
     return str(value).strip()
 
 
+def _clear_dead_local_proxy_env() -> None:
+    for name in _PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        normalized = value.strip().lower().rstrip("/")
+        if normalized in _DEAD_LOCAL_PROXY_VALUES:
+            os.environ.pop(name, None)
+
+
 def get_llm_provider(default: str = "zhipu") -> str:
     provider = _read_env("LLM_PROVIDER", default) or default
     return provider.strip().lower()
@@ -73,7 +101,7 @@ def get_llm_api_key(default: Optional[str] = None) -> str:
     raise RuntimeError("Missing LLM API key. Please set LLM_API_KEY in environment or .env.")
 
 
-def get_llm_model(default: str = "Pro/zai-org/GLM-4.7") -> str:
+def get_llm_model(default: str = "Pro/zai-org/GLM-5.1") -> str:
     return _read_env("LLM_MODEL", default) or default
 
 
@@ -82,6 +110,7 @@ def create_openai_client(base_url: Optional[str] = None, api_key: Optional[str] 
         timeout = float(_read_env("LLM_TIMEOUT", "30") or 30)
     except Exception:
         timeout = 30.0
+    _clear_dead_local_proxy_env()
     client = OpenAI(
         api_key=api_key or get_llm_api_key(),
         base_url=base_url or get_llm_base_url(),

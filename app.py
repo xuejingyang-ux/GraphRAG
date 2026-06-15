@@ -1,4 +1,5 @@
 import atexit
+import io
 import json
 import logging
 import os
@@ -9,7 +10,8 @@ import threading
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+from fastapi import Body, FastAPI, File, Query, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from llm_client import (
     create_openai_client,
@@ -20,7 +22,7 @@ from llm_client import (
 )
 
 
-app = Flask(__name__)
+app = FastAPI(title="MedGraphRAG API", version="2.0.0")
 
 _kg_manager = None
 _kg_init_error = None
@@ -163,23 +165,6 @@ def get_kg_manager():
     if _kg_init_error:
         raise RuntimeError(_kg_init_error)
 
-    try:
-        from knowledge_graph import KnowledgeGraphManager
-
-        _kg_manager = KnowledgeGraphManager()
-        return _kg_manager
-    except Exception as exc:
-        _kg_init_error = f"知识图谱初始化失败: {exc}"
-        raise RuntimeError(_kg_init_error) from exc
-
-
-def get_kg_manager():
-    global _kg_manager, _kg_init_error
-    if _kg_manager is not None:
-        return _kg_manager
-    if _kg_init_error:
-        raise RuntimeError(_kg_init_error)
-
     with _kg_lock:
         if _kg_manager is not None:
             return _kg_manager
@@ -198,7 +183,7 @@ def get_kg_manager():
 def get_llm_client() -> Tuple[Any, str]:
     global _llm_client, _llm_model
     if _llm_client is None:
-        _llm_model = get_llm_model(default="Pro/zai-org/GLM-4.7")
+        _llm_model = get_llm_model(default="Pro/zai-org/GLM-5.1")
         _llm_client = create_openai_client(
             base_url=get_llm_base_url(),
             api_key=get_llm_api_key(),
@@ -234,6 +219,19 @@ def safe_int(value: Any, default: int) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def get_ask_llm_timeout_seconds(default: float = 20.0) -> float:
+    raw = os.getenv("ASK_LLM_TIMEOUT", "").strip()
+    if not raw:
+        raw = os.getenv("LLM_ASK_TIMEOUT", "").strip()
+    if not raw:
+        raw = str(default)
+    try:
+        value = float(raw)
+    except Exception:
+        value = float(default)
+    return max(1.0, min(value, 120.0))
 
 
 def is_pure_numeric_text(value: Any) -> bool:
@@ -713,7 +711,7 @@ def call_llm_with_timeout(
     question: str,
     kg_records: List[Dict[str, Any]],
     vector_hits: Optional[List[Dict[str, Any]]] = None,
-    timeout_seconds: float = 18.0,
+    timeout_seconds: float = 20.0,
 ) -> str:
     result: Dict[str, Any] = {"answer": None, "error": None}
 
@@ -793,7 +791,12 @@ def build_qa_result(question: str) -> Dict[str, Any]:
 
     # E) 检索融合后交给大模型生成答案
     try:
-        answer = call_llm_with_timeout(question, kg_records, vector_hits=vector_hits, timeout_seconds=8.0)
+        answer = call_llm_with_timeout(
+            question,
+            kg_records,
+            vector_hits=vector_hits,
+            timeout_seconds=get_ask_llm_timeout_seconds(default=20.0),
+        )
     except Exception as exc:
         if not isinstance(exc, TimeoutError):
             traceback.print_exc()
@@ -877,51 +880,388 @@ def purge_numeric_nodes_in_neo4j() -> int:
     return safe_int((record or {}).get("deleted_count", 0), 0)
 
 
-@app.route("/")
+MAX_DOCUMENT_UPLOAD_BYTES = 25 * 1024 * 1024
+DOCUMENT_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".csv", ".xls", ".xlsx", ".txt"}
+
+
+def normalize_preview(text: str, limit: int = 1200) -> str:
+    text = re.sub(r"\r\n?", "\n", str(text or ""))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:limit]
+
+
+def decode_text_bytes(data: bytes) -> str:
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="ignore")
+
+
+async def read_document_upload(file: UploadFile) -> Dict[str, Any]:
+    filename = os.path.basename(file.filename or "upload")
+    data = await file.read()
+    if not data:
+        raise ValueError("上传文件为空。")
+    if len(data) > MAX_DOCUMENT_UPLOAD_BYTES:
+        raise ValueError("上传文件超过 25MB，请先压缩或拆分后再解析。")
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in DOCUMENT_EXTENSIONS:
+        raise ValueError("暂只支持 PDF、图片、CSV、Excel 和 TXT 文件。")
+
+    return {
+        "filename": filename,
+        "ext": ext,
+        "content_type": file.content_type or "application/octet-stream",
+        "size": len(data),
+        "data": data,
+    }
+
+
+def document_upload_error(exc: Exception) -> JSONResponse:
+    status_code = 400 if isinstance(exc, ValueError) else 500
+    return JSONResponse(status_code=status_code, content={"success": False, "error": str(exc)})
+
+
+def read_pdf_pages(data: bytes, max_pages: int = 25) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    try:
+        from pypdf import PdfReader
+    except Exception as exc:
+        raise RuntimeError("缺少 pypdf，无法解析 PDF。请先安装 pypdf。") from exc
+
+    reader = PdfReader(io.BytesIO(data))
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt("")
+        except Exception:
+            pass
+
+    pages: List[Dict[str, Any]] = []
+    for index, page in enumerate(reader.pages[:max_pages], start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        mediabox = getattr(page, "mediabox", None)
+        width = float(getattr(mediabox, "width", 0) or 0)
+        height = float(getattr(mediabox, "height", 0) or 0)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        pages.append(
+            {
+                "page": index,
+                "width": round(width, 2),
+                "height": round(height, 2),
+                "line_count": len(lines),
+                "char_count": len(text),
+                "text": text,
+                "preview": normalize_preview(text, 700),
+            }
+        )
+
+    metadata = {}
+    try:
+        metadata = {str(k).lstrip("/"): str(v) for k, v in (reader.metadata or {}).items()}
+    except Exception:
+        metadata = {}
+
+    return pages, {"page_count": len(reader.pages), "metadata": metadata}
+
+
+def parse_uploaded_pdf(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if payload["ext"] != ".pdf":
+        return {"success": False, "error": "PDF解析仅支持 .pdf 文件。", "filename": payload["filename"]}
+
+    pages, info = read_pdf_pages(payload["data"])
+    full_text = "\n\n".join(page.get("text", "") for page in pages).strip()
+    return {
+        "success": True,
+        "task": "pdf",
+        "filename": payload["filename"],
+        "size": payload["size"],
+        "page_count": info["page_count"],
+        "parsed_pages": len(pages),
+        "metadata": info["metadata"],
+        "text_length": len(full_text),
+        "text_preview": normalize_preview(full_text, 1800),
+        "pages": [{k: v for k, v in page.items() if k != "text"} for page in pages[:12]],
+    }
+
+
+def detect_image_blocks(image: Any) -> Dict[str, Any]:
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return {"block_count": 0, "blocks": [], "warning": "缺少 OpenCV，无法做图像块检测。"}
+
+    arr = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    threshold = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 12)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 4))
+    merged = cv2.dilate(threshold, kernel, iterations=1)
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    height, width = gray.shape[:2]
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        if area < max(120, width * height * 0.00015) or w < 12 or h < 6:
+            continue
+        boxes.append({"x": int(x), "y": int(y), "width": int(w), "height": int(h), "area": int(area)})
+    boxes.sort(key=lambda item: (item["y"], item["x"]))
+    return {"block_count": len(boxes), "blocks": boxes[:40]}
+
+
+def ocr_image_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        from PIL import Image
+    except Exception as exc:
+        raise RuntimeError("缺少 Pillow，无法读取图片。") from exc
+
+    image = Image.open(io.BytesIO(payload["data"]))
+    image.load()
+    blocks = detect_image_blocks(image)
+    result = {
+        "success": True,
+        "task": "ocr",
+        "filename": payload["filename"],
+        "size": payload["size"],
+        "image": {"width": image.width, "height": image.height, "mode": image.mode},
+        "text": "",
+        "text_preview": "",
+        "ocr_engine": "not_available",
+        "warnings": [],
+        "layout_blocks": blocks,
+    }
+
+    try:
+        import pytesseract
+
+        try:
+            text = pytesseract.image_to_string(image, lang="chi_sim+eng")
+        except Exception:
+            text = pytesseract.image_to_string(image)
+        result["text"] = text.strip()
+        result["text_preview"] = normalize_preview(text, 1800)
+        result["ocr_engine"] = "tesseract"
+    except Exception as exc:
+        result["warnings"].append(f"OCR 引擎不可用：{exc}。请安装 Tesseract 与 pytesseract 后重试。")
+    return result
+
+
+def recognize_uploaded_document(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if payload["ext"] in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        return ocr_image_payload(payload)
+    if payload["ext"] == ".pdf":
+        pages, info = read_pdf_pages(payload["data"], max_pages=8)
+        text = "\n\n".join(page.get("text", "") for page in pages).strip()
+        return {
+            "success": True,
+            "task": "ocr",
+            "filename": payload["filename"],
+            "size": payload["size"],
+            "page_count": info["page_count"],
+            "text": text,
+            "text_preview": normalize_preview(text, 1800),
+            "ocr_engine": "pdf_text_layer",
+            "warnings": ["当前环境未配置 PDF 页面渲染，已优先读取 PDF 文本层；扫描版 PDF 需安装 PyMuPDF 或 pdf2image + Tesseract。"],
+        }
+    return {"success": False, "error": "OCR识别仅支持 PDF 或图片文件。", "filename": payload["filename"]}
+
+
+def dataframe_to_table_payload(df: Any, sheet_name: str = "table") -> Dict[str, Any]:
+    limited = df.head(80)
+    return {
+        "sheet": sheet_name,
+        "columns": [str(col) for col in list(limited.columns)],
+        "row_count": int(len(df)),
+        "preview_rows": limited.fillna("").astype(str).to_dict(orient="records"),
+    }
+
+
+def infer_text_tables(text: str) -> List[Dict[str, Any]]:
+    rows: List[List[str]] = []
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if "\t" in raw:
+            cells = [cell.strip() for cell in raw.split("\t")]
+        elif "|" in raw:
+            cells = [cell.strip() for cell in raw.strip("|").split("|")]
+        else:
+            cells = [cell.strip() for cell in re.split(r"\s{2,}", raw)]
+        cells = [cell for cell in cells if cell]
+        if len(cells) >= 2:
+            rows.append(cells)
+        if len(rows) >= 80:
+            break
+
+    if not rows:
+        return []
+    max_cols = max(len(row) for row in rows)
+    normalized = [row + [""] * (max_cols - len(row)) for row in rows]
+    columns = [f"列{i + 1}" for i in range(max_cols)]
+    return [{"sheet": "text_table_1", "columns": columns, "row_count": len(rows), "preview_rows": [dict(zip(columns, row)) for row in normalized]}]
+
+
+def structure_uploaded_tables(payload: Dict[str, Any]) -> Dict[str, Any]:
+    ext = payload["ext"]
+    tables: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    if ext == ".csv":
+        import pandas as pd
+
+        text = decode_text_bytes(payload["data"])
+        df = pd.read_csv(io.StringIO(text))
+        tables.append(dataframe_to_table_payload(df, "csv"))
+    elif ext in {".xls", ".xlsx"}:
+        import pandas as pd
+
+        sheets = pd.read_excel(io.BytesIO(payload["data"]), sheet_name=None)
+        for name, df in sheets.items():
+            tables.append(dataframe_to_table_payload(df, str(name)))
+    elif ext == ".pdf":
+        pages, _ = read_pdf_pages(payload["data"], max_pages=12)
+        text = "\n".join(page.get("text", "") for page in pages)
+        tables = infer_text_tables(text)
+        if not tables:
+            warnings.append("未从 PDF 文本层识别到稳定表格；复杂 PDF 表格建议安装 camelot/pdfplumber 后增强。")
+    else:
+        text = decode_text_bytes(payload["data"])
+        tables = infer_text_tables(text)
+        if not tables:
+            warnings.append("当前文件未识别到可结构化的表格行。")
+
+    return {
+        "success": True,
+        "task": "tables",
+        "filename": payload["filename"],
+        "size": payload["size"],
+        "table_count": len(tables),
+        "tables": tables[:8],
+        "warnings": warnings,
+    }
+
+
+def analyze_uploaded_layout(payload: Dict[str, Any]) -> Dict[str, Any]:
+    ext = payload["ext"]
+    if ext == ".pdf":
+        pages, info = read_pdf_pages(payload["data"], max_pages=20)
+        layout_pages = []
+        for page in pages:
+            text = page.get("text", "")
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            layout_pages.append(
+                {
+                    "page": page["page"],
+                    "width": page["width"],
+                    "height": page["height"],
+                    "line_count": len(lines),
+                    "paragraph_count": len(paragraphs),
+                    "estimated_columns": 2 if len(lines) > 25 and page["width"] > page["height"] * 0.7 else 1,
+                    "preview": page["preview"],
+                }
+            )
+        return {
+            "success": True,
+            "task": "layout",
+            "filename": payload["filename"],
+            "size": payload["size"],
+            "page_count": info["page_count"],
+            "pages": layout_pages,
+            "warnings": ["当前版面分析基于 PDF 文本层和页面尺寸做轻量估计。"],
+        }
+
+    if ext in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        try:
+            from PIL import Image
+        except Exception as exc:
+            raise RuntimeError("缺少 Pillow，无法读取图片。") from exc
+        image = Image.open(io.BytesIO(payload["data"]))
+        image.load()
+        blocks = detect_image_blocks(image)
+        return {
+            "success": True,
+            "task": "layout",
+            "filename": payload["filename"],
+            "size": payload["size"],
+            "image": {"width": image.width, "height": image.height, "mode": image.mode},
+            "layout_blocks": blocks,
+            "warnings": [],
+        }
+
+    text = decode_text_bytes(payload["data"])
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return {
+        "success": True,
+        "task": "layout",
+        "filename": payload["filename"],
+        "size": payload["size"],
+        "line_count": len(lines),
+        "paragraph_count": len([part for part in re.split(r"\n\s*\n", text) if part.strip()]),
+        "preview": normalize_preview(text, 1200),
+        "warnings": ["文本类文件无页面坐标，已输出逻辑段落结构。"],
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
 def index():
-    return render_template_string(PAGE_TEMPLATE)
+    return HTMLResponse(content=PAGE_TEMPLATE)
 
 
-@app.route("/api/status")
+@app.get("/api/status")
 def api_status():
-    return jsonify(status_payload())
+    return status_payload()
 
 
-@app.route("/api/graph/full")
-def api_graph_full():
-    limit = safe_int(request.args.get("limit", 300), 300)
+@app.get("/api/graph/full")
+def api_graph_full(limit: int = Query(default=300)):
+    limit = safe_int(limit, 300)
     limit = max(50, min(limit, 1200))
     try:
         kg = get_kg_manager()
         graph = normalize_graph(kg.query_whole_graph(limit=limit))
-        return jsonify({"success": True, "graph": graph})
+        return {"success": True, "graph": graph}
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc), "graph": {"nodes": [], "edges": []}}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(exc), "graph": {"nodes": [], "edges": []}},
+        )
 
 
-@app.route("/api/graph/search")
-def api_graph_search():
-    q = (request.args.get("q", "") or "").strip()
+@app.get("/api/graph/search")
+def api_graph_search(q: str = Query(default="")):
+    q = (q or "").strip()
     if not q:
-        return jsonify({"success": False, "error": "请输入搜索关键词。"}), 400
+        return JSONResponse(status_code=400, content={"success": False, "error": "请输入搜索关键词。"})
     try:
         kg = get_kg_manager()
         graph = normalize_graph(kg.search_nodes(q))
-        return jsonify({"success": True, "graph": graph})
+        return {"success": True, "graph": graph}
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc), "graph": {"nodes": [], "edges": []}}), 500
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(exc), "graph": {"nodes": [], "edges": []}},
+        )
 
 
-@app.route("/api/graph/purge_numeric_nodes", methods=["POST"])
+@app.post("/api/graph/purge_numeric_nodes")
 def api_graph_purge_numeric_nodes():
     try:
         deleted_count = purge_numeric_nodes_in_neo4j()
-        return jsonify({"success": True, "deleted_count": deleted_count})
+        return {"success": True, "deleted_count": deleted_count}
     except Exception as exc:
-        return jsonify({"success": False, "error": f"删除纯数字节点失败: {exc}"}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"删除纯数字节点失败: {exc}"})
 
 
-@app.route("/api/graph/verify_corpus")
+@app.get("/api/graph/verify_corpus")
 def api_graph_verify_corpus():
     try:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -930,24 +1270,22 @@ def api_graph_verify_corpus():
         corpus_nodes = count_corpus_records_in_neo4j()
         noise_nodes = count_noise_nodes_in_neo4j()
         stats = status_payload()
-        return jsonify(
-            {
-                "success": True,
-                "jsonl_total": total_jsonl,
-                "neo4j_corpus_records": corpus_nodes,
-                "noise_nodes": noise_nodes,
-                "entities": safe_int(stats.get("entities", 0), 0),
-                "relationships": safe_int(stats.get("relationships", 0), 0),
-                "verified": bool(total_jsonl > 0 and corpus_nodes == total_jsonl and noise_nodes == 0),
-            }
-        )
+        return {
+            "success": True,
+            "jsonl_total": total_jsonl,
+            "neo4j_corpus_records": corpus_nodes,
+            "noise_nodes": noise_nodes,
+            "entities": safe_int(stats.get("entities", 0), 0),
+            "relationships": safe_int(stats.get("relationships", 0), 0),
+            "verified": bool(total_jsonl > 0 and corpus_nodes == total_jsonl and noise_nodes == 0),
+        }
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": str(exc)})
 
 
-@app.route("/api/import/jsonl", methods=["POST"])
-def api_import_jsonl():
-    data = request.get_json(silent=True) or {}
+@app.post("/api/import/jsonl")
+def api_import_jsonl(data: Optional[Dict[str, Any]] = Body(default=None)):
+    data = data or {}
     base_dir = os.path.dirname(os.path.abspath(__file__))
     default_path = os.path.join(base_dir, "data", "medical_corpus.jsonl")
 
@@ -966,7 +1304,7 @@ def api_import_jsonl():
     use_llm = bool(data.get("use_llm", True))
 
     if not os.path.exists(path):
-        return jsonify({"success": False, "error": f"文件不存在: {path}"}), 404
+        return JSONResponse(status_code=404, content={"success": False, "error": f"文件不存在: {path}"})
 
     from src.kg_builder import MedicalKnowledgeGraphBuilder
 
@@ -977,39 +1315,37 @@ def api_import_jsonl():
             limit=(max_records if max_records > 0 else None),
         )
     except Exception as exc:
-        return jsonify({"success": False, "error": f"导入失败: {exc}"}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"导入失败: {exc}"})
     finally:
         try:
             builder.close()
         except Exception:
             pass
 
-    return jsonify(
-        {
-            "success": True,
-            "message": "JSONL 导入完成（读取文档 -> 抽取实体关系 -> 写入 Neo4j）。",
-            "path": path,
-            "total_records": safe_int(summary.get("total_records", 0), 0),
-            "processed": safe_int(summary.get("processed", 0), 0),
-            "failed": safe_int(summary.get("failed", 0), 0),
-            "documents_in_graph": safe_int(summary.get("documents_in_graph", 0), 0),
-            "entities_in_graph": safe_int(summary.get("entities_in_graph", 0), 0),
-            "mentions_in_graph": safe_int(summary.get("mentions_in_graph", 0), 0),
-            "relations_in_graph": safe_int(summary.get("relations_in_graph", 0), 0),
-            "noise_nodes": safe_int(summary.get("noise_nodes", 0), 0),
-            "verified": bool(summary.get("verified", False)),
-            "errors": summary.get("sample_errors", [])[:10],
-        }
-    )
+    return {
+        "success": True,
+        "message": "JSONL 导入完成（读取文档 -> 抽取实体关系 -> 写入 Neo4j）。",
+        "path": path,
+        "total_records": safe_int(summary.get("total_records", 0), 0),
+        "processed": safe_int(summary.get("processed", 0), 0),
+        "failed": safe_int(summary.get("failed", 0), 0),
+        "documents_in_graph": safe_int(summary.get("documents_in_graph", 0), 0),
+        "entities_in_graph": safe_int(summary.get("entities_in_graph", 0), 0),
+        "mentions_in_graph": safe_int(summary.get("mentions_in_graph", 0), 0),
+        "relations_in_graph": safe_int(summary.get("relations_in_graph", 0), 0),
+        "noise_nodes": safe_int(summary.get("noise_nodes", 0), 0),
+        "verified": bool(summary.get("verified", False)),
+        "errors": summary.get("sample_errors", [])[:10],
+    }
 
 
-@app.route("/api/ask", methods=["POST"])
-def api_ask():
-    data = request.get_json(silent=True) or {}
+@app.post("/api/ask")
+def api_ask(data: Optional[Dict[str, Any]] = Body(default=None)):
+    data = data or {}
     question = (data.get("question", "") or "").strip()
     save_flag = bool(data.get("save_history", True))
     if not question:
-        return jsonify({"success": False, "error": "问题不能为空。"}), 400
+        return JSONResponse(status_code=400, content={"success": False, "error": "问题不能为空。"})
     try:
         result = build_qa_result(question)
         if save_flag:
@@ -1024,52 +1360,84 @@ def api_ask():
             except Exception as history_exc:
                 result["history_id"] = None
                 result["history_error"] = str(history_exc)
-        return jsonify(result)
+        return result
     except Exception as exc:
         traceback.print_exc()
-        return jsonify({"success": False, "error": f"问答失败: {exc}"}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"问答失败: {exc}"})
 
 
-@app.route("/api/history", methods=["GET"])
-def api_history():
-    limit = safe_int(request.args.get("limit", 50), 50)
+@app.get("/api/history")
+def api_history(limit: int = Query(default=50)):
+    limit = safe_int(limit, 50)
     limit = max(1, min(limit, 500))
     try:
         items = list_history(limit=limit)
-        return jsonify({"success": True, "items": items})
+        return {"success": True, "items": items}
     except Exception as exc:
-        return jsonify({"success": False, "error": f"读取历史失败: {exc}", "items": []}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"读取历史失败: {exc}", "items": []})
 
 
-@app.route("/api/history/<int:history_id>", methods=["DELETE"])
+@app.delete("/api/history/{history_id}")
 def api_history_delete(history_id: int):
     try:
         deleted = delete_history_item(history_id)
-        return jsonify({"success": True, "deleted": bool(deleted), "id": history_id})
+        return {"success": True, "deleted": bool(deleted), "id": history_id}
     except Exception as exc:
-        return jsonify({"success": False, "error": f"删除历史失败: {exc}"}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"删除历史失败: {exc}"})
 
 
-@app.route("/api/history", methods=["DELETE"])
+@app.delete("/api/history")
 def api_history_clear():
     try:
         deleted_count = clear_history()
-        return jsonify({"success": True, "deleted_count": deleted_count})
+        return {"success": True, "deleted_count": deleted_count}
     except Exception as exc:
-        return jsonify({"success": False, "error": f"清空历史失败: {exc}"}), 500
+        return JSONResponse(status_code=500, content={"success": False, "error": f"清空历史失败: {exc}"})
+
+
+@app.post("/api/document/pdf")
+async def api_document_pdf(file: UploadFile = File(...)):
+    try:
+        return parse_uploaded_pdf(await read_document_upload(file))
+    except Exception as exc:
+        return document_upload_error(exc)
+
+
+@app.post("/api/document/ocr")
+async def api_document_ocr(file: UploadFile = File(...)):
+    try:
+        return recognize_uploaded_document(await read_document_upload(file))
+    except Exception as exc:
+        return document_upload_error(exc)
+
+
+@app.post("/api/document/tables")
+async def api_document_tables(file: UploadFile = File(...)):
+    try:
+        return structure_uploaded_tables(await read_document_upload(file))
+    except Exception as exc:
+        return document_upload_error(exc)
+
+
+@app.post("/api/document/layout")
+async def api_document_layout(file: UploadFile = File(...)):
+    try:
+        return analyze_uploaded_layout(await read_document_upload(file))
+    except Exception as exc:
+        return document_upload_error(exc)
 
 
 # 旧入口统一收口到新问答页
-@app.route("/login")
-@app.route("/register")
-@app.route("/health_profile")
-@app.route("/diagnosis")
-@app.route("/image_analysis")
-@app.route("/profile/settings")
-@app.route("/admin")
-@app.route("/admin/<path:any_path>")
+@app.get("/login")
+@app.get("/register")
+@app.get("/health_profile")
+@app.get("/diagnosis")
+@app.get("/image_analysis")
+@app.get("/profile/settings")
+@app.get("/admin")
+@app.get("/admin/{any_path:path}")
 def legacy_redirect(any_path: Optional[str] = None):
-    return redirect(url_for("index"))
+    return RedirectResponse(url="/")
 
 
 @atexit.register
@@ -1147,12 +1515,23 @@ PAGE_TEMPLATE = r"""
         .history-meta{font-size:12px;color:var(--dim);margin-top:4px}
         .history-del{border:1px solid rgba(255,0,255,.4);background:rgba(255,0,255,.1);color:#ffd7ff;border-radius:8px;padding:4px 8px;cursor:pointer}
         .history-del:hover{background:rgba(255,0,255,.2)}
+        .doc-panel{margin-top:12px;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px;background:rgba(255,255,255,.02)}
+        .doc-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+        .doc-title{color:var(--dim);font-size:13px;display:flex;align-items:center;gap:6px}
+        .doc-file{width:100%;border:1px dashed var(--border);border-radius:12px;background:rgba(0,245,255,.04);color:var(--text);padding:10px;outline:none}
+        .doc-file::file-selector-button{border:none;border-radius:8px;background:linear-gradient(135deg,var(--primary),var(--secondary));color:#04040e;font-weight:700;padding:8px 12px;margin-right:10px;cursor:pointer}
+        .doc-actions{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:10px}
+        .doc-actions .btn{padding:10px 8px;white-space:nowrap}
+        .doc-result{margin-top:10px;min-height:74px;max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(0,0,0,.16);padding:10px;color:var(--dim);font-size:13px;line-height:1.75}
+        .doc-result strong{color:var(--primary)}
+        .doc-result pre{white-space:pre-wrap;color:var(--text);font-family:'Noto Sans SC',sans-serif}
         .graph-toolbar{display:flex;gap:8px;margin-bottom:10px}
         .graph-toolbar input{flex:1;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.03);color:var(--text);padding:10px 12px;outline:none}
         .graph-toolbar input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,245,255,.12)}
         #graph{width:100%;height:560px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(0,0,0,.22)}
         .graph-foot{margin-top:10px;color:var(--dim);font-size:13px;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
-        @media (max-width:980px){.grid{grid-template-columns:1fr}.card{min-height:auto}#graph{height:460px}}
+        @media (max-width:980px){.grid{grid-template-columns:1fr}.card{min-height:auto}.doc-actions{grid-template-columns:repeat(2,minmax(0,1fr))}#graph{height:460px}}
+        @media (max-width:560px){.doc-actions{grid-template-columns:1fr}.doc-actions .btn{white-space:normal}}
     </style>
 </head>
 <body>
@@ -1188,6 +1567,20 @@ PAGE_TEMPLATE = r"""
                     </div>
                     <div class="history-list" id="historyList"></div>
                 </div>
+                <div class="doc-panel">
+                    <div class="doc-head">
+                        <div class="doc-title"><i class="fa-solid fa-file-waveform"></i> 文档解析</div>
+                        <span class="hint">PDF / OCR / 表格 / 版面</span>
+                    </div>
+                    <input class="doc-file" id="docFile" type="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.csv,.xls,.xlsx,.txt">
+                    <div class="doc-actions">
+                        <button class="btn btn-ghost doc-action" data-doc-task="pdf"><i class="fa-solid fa-file-pdf"></i> PDF解析</button>
+                        <button class="btn btn-ghost doc-action" data-doc-task="ocr"><i class="fa-solid fa-eye"></i> OCR识别</button>
+                        <button class="btn btn-ghost doc-action" data-doc-task="tables"><i class="fa-solid fa-table-cells"></i> 表格结构化</button>
+                        <button class="btn btn-ghost doc-action" data-doc-task="layout"><i class="fa-solid fa-object-group"></i> 版面分析</button>
+                    </div>
+                    <div class="doc-result" id="docResult">等待解析结果。</div>
+                </div>
             </article>
 
             <article class="card">
@@ -1220,10 +1613,19 @@ PAGE_TEMPLATE = r"""
         const exampleQuestionsEl = document.getElementById('exampleQuestions');
         const historyListEl = document.getElementById('historyList');
         const clearHistoryBtn = document.getElementById('clearHistoryBtn');
+        const docFileEl = document.getElementById('docFile');
+        const docResultEl = document.getElementById('docResult');
+        const docActionBtns = Array.from(document.querySelectorAll('.doc-action'));
 
         let network = null;
         let graphFitTimer = null;
         let historyItems = [];
+        const docEndpointByTask = {
+            pdf: '/api/document/pdf',
+            ocr: '/api/document/ocr',
+            tables: '/api/document/tables',
+            layout: '/api/document/layout'
+        };
 
         const typeColors = {
             Disease: '#ff6b6b',
@@ -1284,6 +1686,76 @@ PAGE_TEMPLATE = r"""
         function renderAnswer(markdownText) {
             if (window.marked) answerEl.innerHTML = marked.parse(markdownText || '');
             else answerEl.innerHTML = `<pre style="white-space:pre-wrap;">${safeText(markdownText || '')}</pre>`;
+        }
+
+        function formatBytes(bytes) {
+            const size = Number(bytes || 0);
+            if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(2)} MB`;
+            if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+            return `${size} B`;
+        }
+
+        function summarizeDocumentResult(data) {
+            const lines = [];
+            const taskNames = { pdf: 'PDF解析', ocr: 'OCR识别', tables: '表格结构化', layout: '版面分析' };
+            lines.push(`任务：${taskNames[data.task] || data.task || '文档解析'}`);
+            lines.push(`文件：${data.filename || '-'}（${formatBytes(data.size)}）`);
+            if (data.page_count !== undefined) lines.push(`页数：${data.page_count}`);
+            if (data.parsed_pages !== undefined) lines.push(`已解析页：${data.parsed_pages}`);
+            if (data.text_length !== undefined) lines.push(`文本长度：${data.text_length}`);
+            if (data.table_count !== undefined) lines.push(`表格数量：${data.table_count}`);
+            if (data.image) lines.push(`图像：${data.image.width} x ${data.image.height} / ${data.image.mode}`);
+            if (data.ocr_engine) lines.push(`识别引擎：${data.ocr_engine}`);
+            if (data.layout_blocks?.block_count !== undefined) lines.push(`版面块：${data.layout_blocks.block_count}`);
+            if (Array.isArray(data.warnings) && data.warnings.length) lines.push(`提示：${data.warnings.join('；')}`);
+            return lines.join('\n');
+        }
+
+        function renderDocumentResult(data) {
+            const blocks = [`<strong>解析完成</strong><pre>${safeText(summarizeDocumentResult(data))}</pre>`];
+            const preview = data.text_preview || data.preview || '';
+            if (preview) blocks.push(`<strong>文本预览</strong><pre>${safeText(preview)}</pre>`);
+            if (Array.isArray(data.pages) && data.pages.length) {
+                const pageLines = data.pages.slice(0, 8).map((p) => `P${p.page}: ${p.width || '-'} x ${p.height || '-'}，行 ${p.line_count ?? '-'}，字 ${p.char_count ?? '-'}`);
+                blocks.push(`<strong>页面结构</strong><pre>${safeText(pageLines.join('\n'))}</pre>`);
+            }
+            if (Array.isArray(data.tables) && data.tables.length) {
+                const tableLines = data.tables.slice(0, 3).map((table) => {
+                    const rows = (table.preview_rows || []).slice(0, 4);
+                    return `${table.sheet || 'table'}：${table.row_count || 0} 行\n${JSON.stringify(rows, null, 2)}`;
+                });
+                blocks.push(`<strong>表格预览</strong><pre>${safeText(tableLines.join('\n\n'))}</pre>`);
+            }
+            if (data.layout_blocks?.blocks?.length) {
+                blocks.push(`<strong>版面块预览</strong><pre>${safeText(JSON.stringify(data.layout_blocks.blocks.slice(0, 10), null, 2))}</pre>`);
+            }
+            docResultEl.innerHTML = blocks.join('');
+        }
+
+        async function runDocumentTask(task, btn) {
+            const endpoint = docEndpointByTask[task];
+            const file = docFileEl?.files?.[0];
+            if (!endpoint || !file) {
+                docResultEl.innerHTML = '<span style="color:#ffb703;">请先选择文件。</span>';
+                return;
+            }
+            const formData = new FormData();
+            formData.append('file', file);
+            const originalHtml = btn.innerHTML;
+            docActionBtns.forEach((item) => { item.disabled = true; });
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 解析中';
+            docResultEl.textContent = '正在解析...';
+            try {
+                const resp = await fetch(endpoint, { method: 'POST', body: formData });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) throw new Error(data.error || '解析失败');
+                renderDocumentResult(data);
+            } catch (err) {
+                docResultEl.innerHTML = `<span style="color:#ff6b6b;">解析失败：${safeText(err.message)}</span>`;
+            } finally {
+                docActionBtns.forEach((item) => { item.disabled = false; });
+                btn.innerHTML = originalHtml;
+            }
         }
 
         function buildGraphRelatedExamples(graph) {
@@ -1643,6 +2115,9 @@ PAGE_TEMPLATE = r"""
         searchGraphBtn.addEventListener('click', searchGraph);
         resetGraphBtn.addEventListener('click', loadFullGraph);
         clearHistoryBtn.addEventListener('click', clearAllHistory);
+        docActionBtns.forEach((btn) => {
+            btn.addEventListener('click', () => runDocumentTask(btn.dataset.docTask, btn));
+        });
         graphKeywordEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') searchGraph(); });
         questionEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) askQuestion(); });
 
@@ -1658,4 +2133,6 @@ PAGE_TEMPLATE = r"""
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=5001)
